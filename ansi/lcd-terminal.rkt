@@ -8,7 +8,9 @@
            (struct-out mouse-event)
            (struct-out unknown-escape-sequence)
            (struct-out position-report)
-           (struct-out screen-size-report)))
+           (struct-out screen-size-report)
+           (struct-out kitty-key-event)
+           (struct-out bracketed-paste-event)))
 (provide (struct-out key)
          (struct-out any-mouse-event)
          (struct-out mouse-focus-event)
@@ -16,6 +18,8 @@
          (struct-out unknown-escape-sequence)
          (struct-out position-report)
          (struct-out screen-size-report)
+         (struct-out kitty-key-event)
+         (struct-out bracketed-paste-event)
          add-modifier
          lex-lcd-input
          lcd-terminal-utf-8?
@@ -42,6 +46,14 @@
 (struct any-mouse-event () #:prefab)
 (struct mouse-focus-event any-mouse-event (focus-in?) #:prefab)
 (struct mouse-event any-mouse-event (type button row column modifiers) #:prefab)
+
+;; Kitty keyboard protocol event (CSI u sequences).
+;; event-type is 'press, 'repeat, or 'release.
+;; modifiers is a set of symbols like key's modifiers.
+(struct kitty-key-event (value modifiers event-type) #:prefab)
+
+;; Bracketed paste event (CSI 200~ ... CSI 201~).
+(struct bracketed-paste-event (content) #:prefab)
 
 (define (simple-key value) (key value (set)))
 (define (S- value) (key value (set 'shift)))
@@ -120,7 +132,7 @@
          (apply position-report params)]
     ["R" (decode-shifting params 'f3)]
     ["S" (decode-shifting params 'f4)]
-    ["Z" (C-S- #\I)] ;; TODO: should this instead be a 'backtab key?
+    ["Z" (simple-key 'backtab)]
     ["a" (S- 'up)]
     ["b" (S- 'down)]
     ["c" (S- 'right)]
@@ -173,6 +185,10 @@
 
 (define (interpret-ascii-code b)
   (cond
+   [(= b #x09) (simple-key 'tab)]
+   [(= b #x0a) (simple-key 'enter)]     ;; LF
+   [(= b #x0d) (simple-key 'enter)]     ;; CR
+   [(= b #x1b) (simple-key 'escape)]
    [(<= #x00 b #x1f) (C- (integer->char (+ b (char->integer #\A) -1)))]
    [(<= #x20 b #x7e) (simple-key (integer->char b))]
    [(= b #x7f) (simple-key 'backspace)]))
@@ -225,6 +241,44 @@
     [else
      (mouse-event type button x y modifiers)]))
 
+;; Kitty keyboard protocol keycode mapping.
+(define (kitty-keycode->value code)
+  (cond
+    [(and (>= code 32) (<= code 126)) (integer->char code)]
+    [(= code 27) 'escape]
+    [(= code 13) 'enter]
+    [(= code 9) 'tab]
+    [(= code 127) 'backspace]
+    [(= code 57358) 'backtab]
+    [(= code 57359) 'insert]
+    [(= code 57360) 'delete]
+    [(= code 57361) 'home]
+    [(= code 57362) 'end]
+    [(= code 57363) 'page-up]
+    [(= code 57364) 'page-down]
+    [(= code 57352) 'up]
+    [(= code 57353) 'down]
+    [(= code 57354) 'right]
+    [(= code 57355) 'left]
+    [(= code 57356) 'begin]
+    [(and (> code 0) (<= code #x10FFFF)) (integer->char code)]
+    [else 'unknown]))
+
+;; Decode Kitty keyboard protocol parameters into a kitty-key-event.
+(define (decode-kitty-key keycode modifiers-param event-type-num)
+  (define mod-bits (sub1 (max 1 modifiers-param)))
+  (define mods
+    (set-union (if (zero? (bitwise-and mod-bits 1)) (set) (set 'shift))
+               (if (zero? (bitwise-and mod-bits 2)) (set) (set 'meta))
+               (if (zero? (bitwise-and mod-bits 4)) (set) (set 'control))))
+  (define value (kitty-keycode->value keycode))
+  (define event-type
+    (case event-type-num
+      [(2) 'repeat]
+      [(3) 'release]
+      [else 'press]))
+  (kitty-key-event value mods event-type))
+
 (define (lex-lcd-input port
                        #:utf-8? [utf-8? (lcd-terminal-utf-8?)]
                        #:basic-x11-mouse-support? [basic-x11-mouse-support?
@@ -244,6 +298,31 @@
                                                     #:utf-8? utf-8?
                                                     #:basic-x11-mouse-support?
                                                       basic-x11-mouse-support?))))]
+   ;; Bracketed paste: ESC[200~ ... ESC[201~
+   [(regexp-try-match #px#"^\e\\[200~" port) =>
+    (lambda (_match-result)
+      (define out (open-output-bytes))
+      (let loop ()
+        (cond
+          [(regexp-try-match #px#"^\e\\[201~" port) (void)]
+          [(eof-object? (peek-byte port)) (void)]
+          [else (write-byte (read-byte port) out) (loop)]))
+      (bracketed-paste-event (bytes->string/utf-8 (get-output-bytes out))))]
+   ;; Kitty keyboard protocol query response: ESC[?Nu
+   [(regexp-try-match #px#"^\e\\[\\?([0-9]+)u" port) =>
+    (lambda (match-result)
+      (match-define (list _lexeme flags-bytes) match-result)
+      (define flags (string->number (bytes->string/utf-8 flags-bytes)))
+      (kitty-key-event 'query-response (set) flags))]
+   ;; Kitty keyboard protocol: ESC[keycode(;modifiers(:event_type)?)?u
+   [(regexp-try-match #px#"^\e\\[([0-9]+)(;([0-9]+)(:([0-9]+))?)?u" port) =>
+    (lambda (match-result)
+      (match-define (list _lexeme keycode-bytes _ mod-bytes _ event-type-bytes) match-result)
+      (define keycode (string->number (bytes->string/utf-8 keycode-bytes)))
+      (define modifiers (if mod-bytes (string->number (bytes->string/utf-8 mod-bytes)) 1))
+      (define event-type-num (and event-type-bytes
+                                  (string->number (bytes->string/utf-8 event-type-bytes))))
+      (decode-kitty-key keycode modifiers event-type-num))]
    [(and basic-x11-mouse-support?
          (regexp-try-match #px#"^\e\\[M(...)" port)) =>
     (lambda (match-result)
@@ -268,6 +347,14 @@
     (lambda (match-result)
       (match-define (list lexeme mainbytes) match-result)
       (analyze-vt-O-mainchar lexeme (bytes->string/utf-8 mainbytes)))]
+   ;; Alt+key: ESC followed by a printable character or DEL.
+   ;; This must come after CSI/SS3/mouse/kitty patterns so that
+   ;; ESC [ and ESC O are not misinterpreted as Alt+[ and Alt+O.
+   [(regexp-try-match #px#"^\e([\x20-\x7f])" port) =>
+    (lambda (match-result)
+      (match-define (list _lexeme char-bytes) match-result)
+      (define b (bytes-ref char-bytes 0))
+      (add-modifier 'meta (interpret-ascii-code b)))]
    ;; Characters between #\u80 and #\uff are ambiguous because in
    ;; some terminals, the high bit is set to indicate meta, and in
    ;; others, they are plain UTF-8 characters. We let the user
