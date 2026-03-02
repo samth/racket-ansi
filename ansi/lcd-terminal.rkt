@@ -224,7 +224,8 @@
   (define y (if (zero? y-raw) #f (- y-raw 32)))
   (if (not type)
       (simple-key (unknown-escape-sequence lexeme))
-      (mouse-event type button x y modifiers)))
+      ;; x = column, y = row; struct fields are (type button row column modifiers)
+      (mouse-event type button y x modifiers)))
 
 (define (decode-extended-mouse-event lexeme type-byte x y release? input-next)
   (define-values (type modifiers button) (decode-mouse-event-type (+ type-byte 32)))
@@ -232,14 +233,15 @@
     [(not type)
      (simple-key (unknown-escape-sequence lexeme))]
     [(eq? type 'release-all) ;; This is one of the things the extended format can do better!
-     (mouse-event 'release button x y modifiers)]
+     ;; x = column, y = row; struct fields are (type button row column modifiers)
+     (mouse-event 'release button y x modifiers)]
     [(eq? type 'press)
-     (mouse-event (if release? 'release 'press) button x y modifiers)]
+     (mouse-event (if release? 'release 'press) button y x modifiers)]
     [release?
      ;; Ignore the event -- it's likely a spurious "scroll" release event from st
      (input-next)]
     [else
-     (mouse-event type button x y modifiers)]))
+     (mouse-event type button y x modifiers)]))
 
 ;; Kitty keyboard protocol keycode mapping.
 (define (kitty-keycode->value code)
@@ -285,6 +287,16 @@
                                                    (lcd-terminal-basic-x11-mouse-support?)])
   (cond
    [(eof-object? (peek-byte port)) eof]
+   ;; Standalone Escape: if 0x1b is the first byte and no more bytes are
+   ;; immediately available in the port buffer, this is a standalone Escape
+   ;; key press.  Terminal escape sequences arrive atomically (all bytes in
+   ;; one write), so a lone 0x1b is unambiguous.
+   [(and (= (peek-byte port) #x1b)
+         (let* ([buf (make-bytes 1)]
+                [avail (peek-bytes-avail!* buf 1 #f port)])
+           (or (eof-object? avail) (zero? avail))))
+    (read-byte port)
+    (simple-key 'escape)]
    [(regexp-try-match #px#"^\e\\[<([0-9]+);([0-9]+);([0-9]+)(m|M)" port) =>
     (lambda (match-result)
       (match-define (list lexeme type row column kind) match-result)
