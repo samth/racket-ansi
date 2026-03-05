@@ -4,13 +4,24 @@
 (provide (struct-out key)
          (struct-out unknown-escape-sequence)
          (struct-out position-report)
+         lcd-terminal-escape-delay-ms
          lex-lcd-input)
 
 (require racket/set)
 (require racket/match)
 (require (only-in racket/string string-split))
+(require (only-in racket/port input-port-append))
 
 (define lcd-terminal-utf-8? (make-parameter #t))
+
+;; Delay in milliseconds to wait after receiving a bare ESC (0x1b)
+;; before deciding it is a standalone Escape key press rather than the
+;; start of a multi-byte escape sequence.  Over SSH, escape sequences
+;; can be "torn" across multiple reads, so a non-zero delay is needed
+;; to heuristically distinguish the two cases.  Set to 0 to disable
+;; the delay (treats a lone ESC as standalone immediately when no more
+;; bytes are buffered).
+(define lcd-terminal-escape-delay-ms (make-parameter 50))
 
 (struct unknown-escape-sequence (string) #:prefab)
 (struct key (value modifiers) #:prefab)
@@ -145,6 +156,13 @@
    [(= b #x7f) (simple-key 'backspace)]))
 
 (define (lex-lcd-input port)
+  (lex-lcd-input* port port))
+
+;; Inner lexer.  `orig-port` is the actual input source; `port` is
+;; what we read from — normally the same, but after waiting for a torn
+;; escape sequence it may be a prepended port that re-supplies the ESC
+;; byte we already consumed.
+(define (lex-lcd-input* orig-port port)
   (cond
    [(eof-object? (peek-byte port)) eof]
    [(or (regexp-try-match #px"^\e\\[([0-9]+(;[0-9]+)*)?(.)" port)
@@ -164,6 +182,33 @@
     (lambda (match-result)
       (match-define (list lexeme mainbytes) match-result)
       (analyze-vt-O-mainchar lexeme (bytes->string/utf-8 mainbytes)))]
+   ;; Standalone Escape: if the next byte is 0x1b and no escape
+   ;; sequence regexp matched above, wait up to
+   ;; lcd-terminal-escape-delay-ms for additional bytes to arrive.
+   ;; Over SSH, escape sequences can be "torn" across multiple reads,
+   ;; so we use a short delay to heuristically decide whether this is
+   ;; a standalone Escape key press or the start of a longer sequence.
+   [(= (peek-byte port) #x1b)
+    (read-byte port) ;; consume the ESC
+    (define delay-ms (lcd-terminal-escape-delay-ms))
+    (cond
+      ;; If more data is already available, the regexp matches above
+      ;; should have caught it — but over SSH bytes may have arrived
+      ;; after the regexp attempts.  Re-lex with the ESC prepended.
+      [(byte-ready? orig-port)
+       (lex-lcd-input* orig-port (input-port-append #f (open-input-bytes #"\e") orig-port))]
+      ;; If delay is 0, no waiting — treat as standalone Escape.
+      [(zero? delay-ms)
+       (simple-key 'escape)]
+      ;; Wait for more bytes up to the delay.
+      [(sync/timeout (/ delay-ms 1000.0)
+                     (peek-bytes-evt 1 0 #f orig-port))
+       ;; More bytes arrived — this ESC is part of an escape sequence.
+       ;; Re-lex with the ESC prepended.
+       (lex-lcd-input* orig-port (input-port-append #f (open-input-bytes #"\e") orig-port))]
+      ;; Timeout expired with no further bytes — standalone Escape.
+      [else
+       (simple-key 'escape)])]
    ;; Characters between #\u80 and #\uff are ambiguous because in
    ;; some terminals, the high bit is set to indicate meta, and in
    ;; others, they are plain UTF-8 characters. We let the user
