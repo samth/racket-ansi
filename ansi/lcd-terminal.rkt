@@ -306,6 +306,35 @@
 (define (lex-lcd-input* orig-port port utf-8? basic-x11-mouse-support?)
   (cond
    [(eof-object? (peek-byte port)) eof]
+   ;; Standalone Escape detection: if the next byte is ESC, consume it
+   ;; and check whether more bytes follow.  We must do this BEFORE
+   ;; trying escape-sequence regexps because regexp-try-match blocks
+   ;; on a file port when the pattern partially matches the leading ESC
+   ;; byte but the rest of the sequence hasn't arrived yet.
+   ;;
+   ;; Only apply this when port eq? orig-port (the first call, not a
+   ;; re-lex with a prepended port), to avoid infinite recursion.
+   [(and (eq? port orig-port)
+         (= (peek-byte port) #x1b))
+    (read-byte port) ;; consume the ESC
+    (cond
+      ;; If more data is already buffered, re-lex with ESC prepended
+      ;; so the escape-sequence regexps can match.
+      [(and (byte-ready? orig-port) (not (eof-object? (peek-byte orig-port))))
+       (lex-lcd-input* orig-port (input-port-append #f (open-input-bytes #"\e") orig-port)
+                       utf-8? basic-x11-mouse-support?)]
+      ;; No data yet — wait up to the escape delay for more bytes.
+      [(let ([delay-ms (lcd-terminal-escape-delay-ms)])
+         (and (> delay-ms 0)
+              (let ([result (sync/timeout (/ delay-ms 1000.0)
+                                         (peek-bytes-evt 1 0 #f orig-port))])
+                (and result (not (eof-object? result))))))
+       ;; More bytes arrived — re-lex with ESC prepended.
+       (lex-lcd-input* orig-port (input-port-append #f (open-input-bytes #"\e") orig-port)
+                       utf-8? basic-x11-mouse-support?)]
+      ;; Timeout or zero delay — standalone Escape.
+      [else
+       (simple-key 'escape)])]
    [(regexp-try-match #px#"^\e\\[<([0-9]+);([0-9]+);([0-9]+)(m|M)" port) =>
     (lambda (match-result)
       (match-define (list lexeme type row column kind) match-result)
@@ -375,37 +404,8 @@
       (match-define (list _lexeme char-bytes) match-result)
       (define b (bytes-ref char-bytes 0))
       (add-modifier 'meta (interpret-ascii-code b)))]
-   ;; Standalone Escape: if the next byte is 0x1b and no escape
-   ;; sequence regexp matched above, wait up to
-   ;; lcd-terminal-escape-delay-ms for additional bytes to arrive.
-   ;; Over SSH, escape sequences can be "torn" across multiple reads,
-   ;; so we use a short delay to heuristically decide whether this is
-   ;; a standalone Escape key press or the start of a longer sequence.
-   [(= (peek-byte port) #x1b)
-    (read-byte port) ;; consume the ESC
-    (define delay-ms (lcd-terminal-escape-delay-ms))
-    (cond
-      ;; If more data (not just EOF) is already available, the regexp
-      ;; matches above should have caught it — but over SSH bytes may
-      ;; have arrived after the regexp attempts.  Re-lex with the ESC
-      ;; prepended.
-      [(and (byte-ready? orig-port) (not (eof-object? (peek-byte orig-port))))
-       (lex-lcd-input* orig-port (input-port-append #f (open-input-bytes #"\e") orig-port)
-                       utf-8? basic-x11-mouse-support?)]
-      ;; If delay is 0, no waiting — treat as standalone Escape.
-      [(zero? delay-ms)
-       (simple-key 'escape)]
-      ;; Wait for more bytes up to the delay.
-      [(let ([result (sync/timeout (/ delay-ms 1000.0)
-                                   (peek-bytes-evt 1 0 #f orig-port))])
-         (and result (not (eof-object? result))))
-       ;; More bytes arrived — this ESC is part of an escape sequence.
-       ;; Re-lex with the ESC prepended.
-       (lex-lcd-input* orig-port (input-port-append #f (open-input-bytes #"\e") orig-port)
-                       utf-8? basic-x11-mouse-support?)]
-      ;; Timeout expired with no further bytes — standalone Escape.
-      [else
-       (simple-key 'escape)])]
+   ;; NOTE: Standalone ESC is now handled at the top of lex-lcd-input*
+   ;; (before the regexp-try-match calls) to prevent blocking.
    ;; Characters between #\u80 and #\uff are ambiguous because in
    ;; some terminals, the high bit is set to indicate meta, and in
    ;; others, they are plain UTF-8 characters. We let the user
